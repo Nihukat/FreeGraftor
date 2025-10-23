@@ -23,7 +23,7 @@ class FluxParams:
     qkv_bias: bool
     guidance_embed: bool
 
-
+@torch.compile
 class Flux(nn.Module):
     """
     Transformer model for flow matching on sequences.
@@ -88,7 +88,12 @@ class Flux(nn.Module):
         ref_txts: List[Tensor] = None,
         ref_ys: List[Tensor] = None,
         ref_guidance: Tensor | None = None,
-        info = None,
+        t: float = 0.0,
+        inverse: bool = False,
+        order: int = 1,
+        inject: bool = False,
+        config = None,  # GenerationConfig
+        latent_storage: dict = None,  # For img_ids storage
     ) -> List[Tensor]:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
@@ -122,25 +127,44 @@ class Flux(nn.Module):
             ref_imgs = ref_imgs_
             ref_txts = ref_txts_
         
-        info['pe_embedder'] = self.pe_embedder
+        context = {
+            'pe_embedder': self.pe_embedder,
+            't': t,
+            'inverse': inverse,
+            'order': order,
+            'inject': inject,
+        }
+        
+        if config is not None:
+            context.update({
+                'height': config.height,
+                'width': config.width,
+                'sim_threshold': config.sim_threshold,
+                'cyc_threshold': config.cyc_threshold,
+                'inject_block_ids': config.inject_block_ids,
+                'inject_match_dropout': config.inject_match_dropout,
+            })
+        
+        if latent_storage is not None and 'img_ids' in latent_storage:
+            context['img_ids'] = latent_storage['img_ids']
         
         txt_pe = self.pe_embedder(txt_ids)
         img_pe = self.pe_embedder(img_ids)
 
         cnt = 0
 
-        info['block_type'] = 'double'
+        context['block_type'] = 'double'
         for block in self.double_blocks:
-            info['global_block_id'] = cnt
+            context['global_block_id'] = cnt
             img, ref_imgs, txt, ref_txts = block(img=img, ref_imgs=ref_imgs, ref_masks=ref_masks, txt=txt, ref_txts=ref_txts, 
-                             vec=vec, ref_vecs=ref_vecs, txt_pe=txt_pe, img_pe=img_pe, info=info)
+                             vec=vec, ref_vecs=ref_vecs, txt_pe=txt_pe, img_pe=img_pe, context=context)
             cnt += 1
         
-        info['block_type'] = 'single'
+        context['block_type'] = 'single'
         for block in self.single_blocks:
-            info['global_block_id'] = cnt
+            context['global_block_id'] = cnt
             img, ref_imgs, txt, ref_txts = block(img=img, ref_imgs=ref_imgs, ref_masks=ref_masks, txt=txt, ref_txts=ref_txts, 
-                             vec=vec, ref_vecs=ref_vecs, txt_pe=txt_pe, img_pe=img_pe, info=info)
+                             vec=vec, ref_vecs=ref_vecs, txt_pe=txt_pe, img_pe=img_pe, context=context)
             cnt += 1
 
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)

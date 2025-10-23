@@ -1,11 +1,12 @@
 import os
-# os.environ['FLUX_DEV'] = '/workspace/yzb/pretrained/huggingface/diffusers/FLUX.1-dev'
-# os.environ['GROUNDING_DINO'] = '/workspace/yzb/pretrained/huggingface/grounding-dino-tiny'
-# os.environ['SAM'] = './sam_vit_h_4b8939.pth'
+os.environ['FLUX_DEV'] = '/workspace/yzb/pretrained/huggingface/black-forest-labs/FLUX.1-dev'
+os.environ['GROUNDING_DINO'] = '/workspace/yzb/pretrained/huggingface/IDEA-Research/grounding-dino-tiny'
+os.environ['SAM'] = '/workspace/yzb/pretrained/huggingface/HCMUE-Research/SAM-vit-h/sam_vit_h_4b8939.pth'
+
 
 import gradio as gr
 from collections import defaultdict
-from pipeline import FreeGraftorPipeline, ConceptConfig
+from pipeline import FreeGraftorPipeline, ConceptConfig, GenerationConfig
 
 MAX_REFERENCES = 5
 
@@ -122,8 +123,7 @@ with gr.Blocks(title="FreeGraftor Image Generation") as demo:
                       start_seed=0, width=1024, height=1024, 
                       start_inject_step=0, end_inject_step=25, start_inject_block=0, end_inject_block=56, 
                       sim_threshold=0.2, cyc_threshold=1.5, inject_match_dropout=0.2, 
-                      offload=False, clear_image_cache=False, clear_image_info_cache=False, *concept_params):
-        # Extract images and parameters from inputs
+            offload=False, clear_image_cache=False, clear_image_info_cache=False, *concept_params):
         images = concept_params[:MAX_REFERENCES]
         other_params = concept_params[MAX_REFERENCES:]
         
@@ -140,27 +140,27 @@ with gr.Blocks(title="FreeGraftor Image Generation") as demo:
             "subjects": []
         }
         
-        def get_nested_dict():
-            return defaultdict(get_nested_dict)
-        info = get_nested_dict()
+        inject_block_ids = list(range(start_inject_block, end_inject_block + 1))
         
-        info['guidance'] = guidance
-        info['num_steps'] = num_steps
-        info['start_inject_step'] = start_inject_step
-        info['end_inject_step'] = end_inject_step
-        info['inject_block_ids'] = list(range(start_inject_block, end_inject_block + 1))
-        info['sim_threshold'] = sim_threshold
-        info['cyc_threshold'] = cyc_threshold
-        info['inject_match_dropout'] = inject_match_dropout
-        info['width'] = width
-        info['height'] = height
+        info = {
+            'guidance': guidance,
+            'num_steps': num_steps,
+            'start_inject_step': start_inject_step,
+            'end_inject_step': end_inject_step,
+            'inject_block_ids': inject_block_ids,
+            'sim_threshold': sim_threshold,
+            'cyc_threshold': cyc_threshold,
+            'inject_match_dropout': inject_match_dropout,
+            'width': width,
+            'height': height
+        }
         
         concept_configs = []
         
         for i in range(valid_count):
             param_start = i * 7
             if valid_images[i] is not None:
-                config = {
+                config_dict = {
                     "class_name": other_params[param_start],
                     "image_path": valid_images[i],
                     "scale": other_params[param_start+1],
@@ -170,16 +170,17 @@ with gr.Blocks(title="FreeGraftor Image Generation") as demo:
                     "flip": other_params[param_start+5],
                     "alignment": other_params[param_start+6],
                 }
-                concept_configs.append(ConceptConfig(**config))
+                concept_configs.append(ConceptConfig(**config_dict))
+                
                 config_summary["subjects"].append({
-                    "class_name": other_params[param_start],
-                    "scale": other_params[param_start+1],
+                    "class_name": config_dict["class_name"],
+                    "scale": config_dict["scale"],
                     "affine_transformation": {
-                        "x": other_params[param_start+2],
-                        "y": other_params[param_start+3],
-                        "angle": other_params[param_start+4],
-                        "flip": other_params[param_start+5],
-                        "alignment": other_params[param_start+6]
+                        "x": config_dict["x_bias"],
+                        "y": config_dict["y_bias"], 
+                        "angle": config_dict["angle"],
+                        "flip": config_dict["flip"],
+                        "alignment": config_dict["alignment"]
                     }
                 })
 
@@ -211,14 +212,13 @@ with gr.Blocks(title="FreeGraftor Image Generation") as demo:
             
             current_progress_html = progress_callback(0, num_steps, i, num_images)
             yield [], config_summary
-            
+            pipeline.requires_offload = offload
             result = pipeline(
                 prompt=prompt,
                 concept_configs=concept_configs,
-                offload=offload,
                 clear_image_cache=clear_image_cache,
                 clear_image_info_cache=clear_image_info_cache,
-                info=info,
+                config=GenerationConfig(**info),
                 callback=lambda step, total_steps: progress_callback(step, total_steps, i, num_images)
             )
             outputs.append(result)

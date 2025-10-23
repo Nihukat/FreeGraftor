@@ -85,7 +85,7 @@ def load_flow_model(name: str, device: str | torch.device = "cuda", hf_download:
         ckpt_path = hf_hub_download(configs[name].repo_id, configs[name].repo_flow)
 
     with torch.device("meta" if ckpt_path is not None else device):
-        model = Flux(configs[name].params).to(torch.bfloat16)
+        model = Flux(configs[name].params)
 
     if ckpt_path is not None:
         print("Loading checkpoint")
@@ -93,6 +93,7 @@ def load_flow_model(name: str, device: str | torch.device = "cuda", hf_download:
         sd = load_sft(ckpt_path, device=str(device))
         missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
         print_load_warning(missing, unexpected)
+    model = model.to(torch.bfloat16)
     return model
 
 
@@ -124,6 +125,7 @@ def load_ae(name: str, device: str | torch.device = "cuda", hf_download: bool = 
         sd = load_sft(ckpt_path, device=str(device))
         missing, unexpected = ae.load_state_dict(sd, strict=False, assign=True)
         print_load_warning(missing, unexpected)
+    ae = ae.to(torch.bfloat16)
     return ae
 
 

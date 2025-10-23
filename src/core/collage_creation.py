@@ -17,53 +17,73 @@ from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
 from utils.load_and_save import save_image, load_image_info, save_image_info, load_image
 
+
 class CollageCreator:
-    def __init__(self, models=None, device='cuda:0', image_cache_dir='./image_cache', image_info_cache_dir='./image_info_cache'):
+    def __init__(self, models=None, device='cuda:0', image_cache_dir='./image_cache', image_info_cache_dir='./image_info_cache', requires_offload=False):
         self.device = device
         self.image_cache_dir = image_cache_dir
         self.image_info_cache_dir = image_info_cache_dir
-        
-        if 'lama' in models:
-            self.lama = models['lama']
+        self.requires_offload = requires_offload
+        if self.requires_offload:
+            device = 'cpu'
         else:
-            self.lama = pipeline(Tasks.image_inpainting, model='iic/cv_fft_inpainting_lama', refine=True, device=self.device)
-            models['lama'] = self.lama
+            device = self.device
+
+        self._load_models(models, device=self.device)
+    
+    def _load_models(self, models, device='cpu'):
+        if models is None:
+            models = {}
+            
+        if 'lama' not in models:
+            models['lama'] = pipeline(Tasks.image_inpainting, model='iic/cv_fft_inpainting_lama', 
+                                    refine=True, device=self.device, dtype=torch.bfloat16)
+        self.lama = models['lama']
         
-        if 'grounding_dino_processor' in models:
-            self.grounding_dino_processor = models['grounding_dino_processor']
-        else:
-            self.grounding_dino_processor = AutoProcessor.from_pretrained(os.getenv('GROUNDING_DINO'))
-            models['grounding_dino_processor'] = self.grounding_dino_processor
+        if 'grounding_dino_processor' not in models:
+            models['grounding_dino_processor'] = AutoProcessor.from_pretrained(os.getenv('GROUNDING_DINO'))
+        self.grounding_dino_processor = models['grounding_dino_processor']
         
-        if 'grounding_dino' in models:
-            self.grounding_dino = models['grounding_dino']
-        else:
-            self.grounding_dino = AutoModelForZeroShotObjectDetection.from_pretrained(os.getenv('GROUNDING_DINO')).to(self.device)
-            models['grounding_dino'] = self.grounding_dino
+        if 'grounding_dino' not in models:
+            models['grounding_dino'] = AutoModelForZeroShotObjectDetection.from_pretrained(
+                os.getenv('GROUNDING_DINO')).to(device=device, dtype=torch.bfloat16)
+        self.grounding_dino = models['grounding_dino']
         
-        if 'sam' in models:
-            self.sam = models['sam']
-        else:
-            self.sam = SamPredictor(sam_model_registry['vit_h'](checkpoint=os.getenv('SAM')))
-            self.sam.model = self.sam.model.to(self.device)
-            models['sam'] = self.sam
+        if 'sam' not in models:
+            sam_predictor = SamPredictor(sam_model_registry['vit_h'](checkpoint=os.getenv('SAM')))
+            sam_predictor.model = sam_predictor.model.to(device=device, dtype=torch.bfloat16)
+            models['sam'] = sam_predictor
+        self.sam = models['sam']
+        
+        self._optimize_models()
+    
+    def _optimize_models(self):
+        if hasattr(self.grounding_dino, 'eval'):
+            self.grounding_dino.eval()
+        
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
     
     def offload(self):
-        self.lama = self.lama.to('cpu')
         self.grounding_dino = self.grounding_dino.to('cpu')
         self.sam.model = self.sam.model.to('cpu')
+        self.lama.infer_model = self.lama.infer_model.to('cpu')
         torch.cuda.empty_cache()
     
     def onload(self):
-        self.lama = self.lama.to(self.device)
         self.grounding_dino = self.grounding_dino.to(self.device)
         self.sam.model = self.sam.model.to(self.device)
+        self.lama.infer_model = self.lama.infer_model.to(self.device)
     
     @torch.inference_mode()
     def grounding(self, image_path=None, pil_image=None, prompt="", box_threshold=0.35, text_threshold=0.25):
         image = load_image(image_path, pil_image)
-        inputs = self.grounding_dino_processor(images=image, text=[[prompt]], return_tensors="pt").to(self.device)
-        outputs = self.grounding_dino(**inputs)
+        
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
+            inputs = self.grounding_dino_processor(images=image, text=[[prompt]], return_tensors="pt").to(self.device)
+            outputs = self.grounding_dino(**inputs)
+            
         results = self.grounding_dino_processor.post_process_grounded_object_detection(
             outputs,
             threshold=box_threshold,
@@ -84,28 +104,29 @@ class CollageCreator:
         if image_path is not None: 
             cv2_image = cv2.imread(image_path)
         else:
-            cv2_image = cv2.cvtColor(np.asarray(pil_image), cv2.COLOR_RGB2BGR)
+            cv2_image = cv2.cvtColor(np.asarray(image_pil), cv2.COLOR_RGB2BGR)
         
         image = cv2.cvtColor(cv2_image, cv2.COLOR_BGR2RGB)
         self.sam.set_image(image)
         
-        transformed_boxes = self.sam.transform.apply_boxes_torch(boxes, image.shape[:2]).to(self.device)
-        masks, _, _ = self.sam.predict_torch(
-            point_coords=None,
-            point_labels=None,
-            boxes=transformed_boxes,
-            multimask_output=False
-        )
-        
-        combined = sorted(zip(boxes, masks, scores), key=lambda x: -x[-1])
-        mask_list = []
-        box_list = []
-        
-        for item in combined:
-            box_list.append(item[0])
-            mask_list.append(item[1])
+        if len(boxes) > 0:
+            transformed_boxes = self.sam.transform.apply_boxes_torch(boxes, image.shape[:2]).to(self.device)
             
-        return mask_list, box_list
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
+                masks, _, _ = self.sam.predict_torch(
+                    point_coords=None,
+                    point_labels=None,
+                    boxes=transformed_boxes,
+                    multimask_output=False
+                )
+            
+            combined = list(zip(boxes, masks, scores))
+            combined.sort(key=lambda x: x[2], reverse=True)
+            
+            mask_list, box_list = zip(*[(item[1], item[0]) for item in combined])
+            return list(mask_list), list(box_list)
+        else:
+            return [], []
     
     def erase(self, image_path=None, mask_path=None, pil_image=None, pil_mask=None):
         if image_path is None:
@@ -117,6 +138,8 @@ class CollageCreator:
             'img': image_path,
             'mask': mask_path
         }
+        # with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.device.startswith('cuda')):
+        #     outputs = self.lama(inputs)
         outputs = self.lama(inputs)
         erased_array_bgr = outputs[OutputKeys.OUTPUT_IMG]
         erased_array_rgb = erased_array_bgr[..., ::-1]
@@ -241,7 +264,7 @@ class CollageCreator:
 
         return img3, mask3
     
-    def __call__(self, template, concept_configs):
+    def __call__(self, template, concept_configs, mask_iou_threshold=0.8):
         erasion_mask_array = np.zeros((template.size[1], template.size[0]), dtype=np.uint8)
         instance_count = defaultdict(int)
         all_image_info = []
@@ -267,17 +290,38 @@ class CollageCreator:
                 all_image_info.append(image_info)
             
         detections = {}
+        detected_masks = []
         for class_name, n_objs in instance_count.items():
             if not class_name in detections:
                 detections[class_name] = deque()
             mask_list, bbox_list = self.segment(pil_image=template, prompt=class_name)
-            for idx in range(n_objs):
+            # for idx in range(n_objs):
+            idx = 0
+            count = 0
+            while count < n_objs and idx < len(mask_list):
                 mask, bbox = mask_list[idx], bbox_list[idx]
                 tar_bbox = torch.tensor([int(m) for m in bbox], dtype=torch.int32)
                 tar_mask_array = mask.squeeze(dim=0).cpu().numpy().astype('uint8')
+                overlap = False
+                if len(detected_masks):
+                    for detected_mask in detected_masks:
+                        intersection = (tar_mask_array * detected_mask).sum()
+                        union = tar_mask_array + detected_mask
+                        union[union>1] = 1
+                        union = union.sum()
+                        iou = intersection / union
+                        if iou > mask_iou_threshold:
+                            overlap = True
+                            break
+                    if overlap:
+                        idx += 1
+                        continue
+                detected_masks.append(tar_mask_array)
                 tar_mask = Image.fromarray(tar_mask_array*255).convert('L')
                 erasion_mask_array += tar_mask_array
                 detections[class_name].append((tar_mask, tar_bbox))
+                idx += 1
+                count += 1
                 
         erasion_mask_array[erasion_mask_array > 0] = 1        
         area = np.sum(erasion_mask_array)
@@ -292,6 +336,8 @@ class CollageCreator:
         template_mask = Image.new('L', template_erased.size, color='black')
         template_pasted = template_erased
         for config, image_info in zip(concept_configs, all_image_info):
+            if not len(detections[config.class_name]):
+                break
             tar_mask, tar_bbox = detections[config.class_name].popleft()
             ref_image = Image.open(config.image_path).convert('RGB')
             ref_mask = Image.fromarray(image_info['mask_raw'].numpy().astype('uint8')*255).convert('L')

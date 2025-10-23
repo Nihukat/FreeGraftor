@@ -195,7 +195,8 @@ def denoise_fireflow(
     # sampling parameters
     timesteps: list[float],
     inverse,
-    info, 
+    config=None,  # GenerationConfig instance
+    latent_storage: dict = None,  # for storing latents
     guidance: float = 4.0,
     ref_imgs: List[Tensor] = None, 
     ref_txts: List[Tensor] = None,
@@ -204,11 +205,13 @@ def denoise_fireflow(
     store_latents: bool = True,
     callback=None
 ):
+    if latent_storage is None:
+        latent_storage = {}
+    latent_storage['img_ids'] = img_ids.cpu()
     
-    info['image_info']['img_ids'] = img_ids.cpu()
     # this is ignored for schnell
     inject_list = [False] * len(timesteps[:-1])
-    inject_list[info['start_inject_step']:info['end_inject_step']] = [True] * (info['end_inject_step'] - info['start_inject_step'])
+    inject_list[config.start_inject_step:config.end_inject_step] = [True] * (config.end_inject_step - config.start_inject_step)
     if inverse:
         timesteps = timesteps[::-1]
         inject_list = inject_list[::-1]
@@ -219,16 +222,16 @@ def denoise_fireflow(
     ref_next_step_velocitys = None
     for i, (t_curr, t_prev) in tqdm(enumerate(zip(timesteps[:-1], timesteps[1:])), 'sampling'):
         t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
-        info['t'] = t_prev if inverse else t_curr
-        info['inverse'] = inverse
-        info['order'] = 1
-        info['inject'] = inject_list[i]
+        t = t_prev if inverse else t_curr
         
         if not inverse and ref_imgs is not None:
-            t = info['t']
             t_str = f't_{t:.4f}'
-            assert len(ref_imgs) == len(info['image_info']['latents'][t_str]['ref_imgs'])
-            ref_imgs = [m.cuda() for m in info['image_info']['latents'][t_str]['ref_imgs']]
+            
+            if t_str in latent_storage:
+                stored_refs = latent_storage[t_str]
+                if stored_refs is not None and len(stored_refs) == len(ref_imgs):
+                    ref_imgs = [ref.to(ref_imgs[0].device) for ref in stored_refs]
+                del latent_storage[t_str]
 
         if next_step_velocity is None:
             pred, ref_preds = model(
@@ -244,7 +247,12 @@ def denoise_fireflow(
                 timesteps=t_vec,
                 guidance=guidance_vec,
                 ref_guidance=ref_guidance_vec,
-                info=info
+                t=t,
+                inverse=inverse,
+                order=1,
+                inject=inject_list[i],
+                config=config,
+                latent_storage=latent_storage
             )
         else:
             pred = next_step_velocity
@@ -258,7 +266,6 @@ def denoise_fireflow(
             ref_img_mids = None
 
         t_vec_mid = torch.full((img.shape[0],), t_curr + (t_prev - t_curr) / 2, dtype=img.dtype, device=img.device)
-        info['order'] = 2
         pred_mid, ref_pred_mids = model(
             img=img_mid,
             ref_imgs=ref_img_mids,
@@ -272,7 +279,12 @@ def denoise_fireflow(
             timesteps=t_vec_mid,
             guidance=guidance_vec,
             ref_guidance=ref_guidance_vec,
-            info=info
+            t=t,
+            inverse=inverse,
+            order=2,
+            inject=inject_list[i],
+            config=config,
+            latent_storage=latent_storage
         )
         next_step_velocity = pred_mid
         if ref_pred_mids is not None:
@@ -283,17 +295,12 @@ def denoise_fireflow(
             ref_imgs = [ref_img + (t_prev - t_curr) * ref_pred_mid for ref_img, ref_pred_mid in zip(ref_imgs, ref_pred_mids)]
 
         if inverse and store_latents:
-            t = info['t']
             t_str = f't_{t:.4f}'
-            if not isinstance(info['image_info']['latents'][t_str]['ref_imgs'], list):
-                info['image_info']['latents'][t_str]['ref_imgs'] = []            
-            info['image_info']['latents'][t_str]['ref_imgs'].append(img.cpu())
+            latent_storage[t_str] = img.cpu().unsqueeze(0)
             
         if callback is not None:
-            callback(i+1, info['num_steps']*3)
+            callback(i+1, config.num_steps*3)
             
-            
-
     if ref_imgs is not None:
         return img, ref_imgs
     else:

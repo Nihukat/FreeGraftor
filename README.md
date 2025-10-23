@@ -3,7 +3,7 @@
 <h1>FreeGraftor</h1>
 <h3>FreeGraftor: Training-Free Cross-Image Feature Grafting for Subject-Driven Text-to-Image Generation</h3>
 
-Zebin Yao, &nbsp; Lei Ren, &nbsp; Huixing Jiang, &nbsp; Chen Wei, &nbsp; Xiaojie Wang, &nbsp; Ruifan Li, &nbsp; Fangxiang Feng
+Zebin Yao, &nbsp; Lei Ren, &nbsp; Huixing Jiang, &nbsp; Wei Chen, &nbsp; Xiaojie Wang, &nbsp; Ruifan Li, &nbsp; Fangxiang Feng
 
 [![arXiv](https://img.shields.io/badge/arXiv-<2504.15958>-<COLOR>.svg)](https://arxiv.org/abs/2504.15958)
 

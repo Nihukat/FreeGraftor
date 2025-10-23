@@ -8,6 +8,7 @@ from torchvision import transforms
 from PIL import Image
 from pathlib import Path
 from einops import rearrange
+import gc
 
 from flux.sampling import denoise_fireflow as denoise_fn
 from flux.sampling import prepare, get_schedule, unpack
@@ -27,174 +28,207 @@ class ConceptConfig:
     flip: bool = field(default=False)
     alignment: str = field(default="center")
 
+@dataclass
+class GenerationConfig:
+    seed: int = 0
+    num_steps: int = 25
+    guidance: float = 3.0
+    width: int = 1024
+    height: int = 1024
+    start_inject_step: int = 0
+    end_inject_step: int = 25
+    inject_block_ids: List[int] = field(default_factory=lambda: list(range(0, 57)))
+    sim_threshold: float = 0.2
+    cyc_threshold: float = 1.5
+    inject_match_dropout: float = 0.2
+
 class FreeGraftorPipeline:
-    def __init__(self, models=None, device="cuda", image_cache_dir='./image_cache', image_info_cache_dir='./image_info_cache'):
+    def __init__(self, models=None, device="cuda", image_cache_dir='./image_cache', image_info_cache_dir='./image_info_cache', requires_offload=False):
         self.device = device
+        self.requires_offload = requires_offload
+        
+        # self.tracker = MemTracker()
+        
+        
+        if self.requires_offload:
+            device = 'cpu'
+        else:
+            device = self.device
+        
         if models is None:
             models = {}
-        self.load_flux(models)
+            
+        self.load_flux(models, device=device)
         
         self.image_cache_dir = image_cache_dir
         self.image_info_cache_dir = image_info_cache_dir
         
-        self.collage_creator = CollageCreator(models=models, device=self.device, image_cache_dir=image_cache_dir, image_info_cache_dir=image_info_cache_dir)
-
-    def load_flux(self, models):
-        if 't5' in models:
-            self.t5 = models['t5']
-        else:
-            self.t5 = load_t5(os.getenv('FLUX_DEV'), self.device, max_length=512)
-            models['t5'] = self.t5
-        if 'clip' in models:
-            self.clip = models['clip']
-        else:
-            self.clip = load_clip(os.getenv('FLUX_DEV'), self.device)
-            models['clip'] = self.clip
-        if 'flow' in models:
-            self.flow = models['flow']
-        else:
-            self.flow = load_flow_model('flux-dev', self.device)
-            models['flow'] = self.flow
-        if 'ae' in models:
-            self.ae = models['ae']
-        else:
-            self.ae = load_ae('flux-dev', self.device)
-            models['ae'] = self.ae
-            
-    def onload(self, modules=['ae']):
-        if 't5' in modules:
-            self.t5 = self.t5.to(self.device)
-        if 'clip' in modules:
-            self.clip = self.clip.to(self.device)
-        if 'ae' in modules:
-            self.ae = self.ae.to(self.device)
-        if 'flow' in modules:
-            self.flow = self.flow.to('cpu')
-        if 'collage_creator' in modules:
-            self.collage_creator.onload()
+        self.collage_creator = CollageCreator(models=models, device=self.device, 
+                                              image_cache_dir=image_cache_dir, image_info_cache_dir=image_info_cache_dir, 
+                                              requires_offload=requires_offload)
         
-    def offload(self, modules=['ae']):
-        if 't5' in modules:
-            self.t5 = self.t5.to('cpu')
-        if 'clip' in modules:
-            self.clip = self.clip.to('cpu')
-        if 'ae' in modules:
-            self.ae = self.ae.to('cpu')
-        if 'flow' in modules:
-            self.flow = self.flow.to('cpu')
-        if 'collage_creator' in modules:
-            self.collage_creator.offload()
+
+    def load_flux(self, models, device='cpu'):
+        model_loaders = {
+            't5': lambda: load_t5(os.getenv('FLUX_DEV'), device, max_length=512),
+            'clip': lambda: load_clip(os.getenv('FLUX_DEV'), device),
+            'flow': lambda: load_flow_model('flux-dev', self.device),
+            'ae': lambda: load_ae('flux-dev', device)
+        }
+     
+        for name, loader in model_loaders.items():
+            if name in models:
+                setattr(self, name, models[name])
+            else:
+                model = loader()
+                models[name] = model
+                setattr(self, name, model)
+            print(f"{name} loaded to {device}")
+            
+    def onload(self, modules=['flow', 't5', 'clip', 'ae', 'collage_creator']):
+        print('onload', modules)
+        for module in modules:
+            if module == 'collage_creator':
+                self.collage_creator.onload()
+            elif hasattr(self, module):
+                setattr(self, module, getattr(self, module).to(self.device))
+        
+        
+    def offload(self, modules=['flow', 't5', 'clip', 'ae', 'collage_creator']):
+        print('offload', modules)
+        for module in modules:
+            if module == 'collage_creator':
+                self.collage_creator.offload()
+            elif hasattr(self, module):
+                setattr(self, module, getattr(self, module).to('cpu'))
         
         torch.cuda.empty_cache()
         
     @torch.inference_mode()
-    def generate_template(self, prompt: str, info, offload=False, callback=None):
-        torch.manual_seed(info['seed'])
-        init_noise = torch.randn((1, info['height'] * info['width'] // 256 , 64)).to(self.device).to(torch.bfloat16)
-        x = torch.randn((1, 16, info['height'] // 8, info['width'] // 8)).to(self.device).to(torch.bfloat16)
+    def generate_template(self, prompt: str, config: GenerationConfig, callback=None):
+        torch.manual_seed(config.seed)
+        dtype = torch.bfloat16
+        init_noise = torch.randn((1, config.height * config.width // 256, 64), 
+                                device=self.device, dtype=dtype)
+        x = torch.randn((1, 16, config.height // 8, config.width // 8), 
+                       device=self.device, dtype=dtype)
+        
         inp_gen = prepare(self.t5, self.clip, x, prompt=prompt)
+        
         inp_gen['img'] = init_noise
-        timesteps = get_schedule(info['num_steps'], inp_gen["img"].shape[1], shift=True)
-        if offload:
-            self.offload()
-        gen_x = denoise_fn(self.flow, **inp_gen, timesteps=timesteps, guidance=info['guidance'], inverse=False, info=info, callback=callback)
-        if offload:
-            self.onload()
-        gen_x = unpack(gen_x.float(), info['height'], info['width'])
-        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+        timesteps = get_schedule(config.num_steps, inp_gen["img"].shape[1], shift=True)
+        
+        gen_x = denoise_fn(self.flow, **inp_gen, timesteps=timesteps, guidance=config.guidance, 
+                          inverse=False, config=config, latent_storage={}, callback=callback)
+            
+        gen_x = unpack(gen_x.float(), config.height, config.width)
+        
+        if self.requires_offload:
+            self.onload(['ae'])
+        
+        with torch.autocast(device_type=self.device, dtype=dtype):
             x = self.ae.decode(gen_x)  
+        if self.requires_offload:
+            self.offload(['ae'])
         x = x.clamp(-1, 1).float()
         x = rearrange(x[0], "c h w -> h w c") 
         img = Image.fromarray((127.5 * (x + 1.0)).cpu().byte().numpy())
-        return img 
-        
-    def create_collage(self, prompt, concept_configs, info, template_path=None, offload=False, callback=None):
+        return img, inp_gen
+    
+    def create_collage(self, prompt, concept_configs, config: GenerationConfig, template_path=None, callback=None):
         if template_path and Path(template_path).is_file():
             template = Image.open(template_path).convert('RGB')
+            inp_gen = None
         else:
-            template = self.generate_template(prompt, info, offload=offload, callback=callback)
-            template_path = save_image(template, self.image_cache_dir, suffix='template')
             
+            template, inp_gen = self.generate_template(prompt, config, callback=callback)
+            template_path = save_image(template, self.image_cache_dir, suffix='template')
+        
         collage, collage_mask = self.collage_creator(template, concept_configs)
+        collage_mask_array = np.array(collage_mask, dtype=np.uint8) // 255
+        collage_mask_tensor = torch.from_numpy(collage_mask_array).unsqueeze(0).unsqueeze(0)
+        collage_mask_tensor = collage_mask_tensor.to(device=self.device, dtype=torch.bfloat16)
         
-        collage_mask_array = np.array(collage_mask).astype(np.uint8) // 255
-        collage_mask_tensor = torch.tensor(collage_mask_array).unsqueeze(dim=0).unsqueeze(dim=0).to(device=self.device, dtype=torch.bfloat16)
-        collage_mask_tensor = transforms.Resize((collage_mask_tensor.shape[2]//16, collage_mask_tensor.shape[3]//16))(collage_mask_tensor)
-        collage_mask_tensor = collage_mask_tensor.flatten()          
+        target_size = (collage_mask_tensor.shape[2]//16, collage_mask_tensor.shape[3]//16)
+        collage_mask_tensor = torch.nn.functional.interpolate(
+            collage_mask_tensor.float(), size=target_size, mode='nearest'
+        ).to(torch.bfloat16).flatten()          
         
-        return collage, collage_mask_tensor
+        
+        return collage, collage_mask_tensor, inp_gen
     
     @torch.inference_mode()
-    def invert(self, image_path=None, pil_image=None, prompt="", info=None, offload=False, callback=None):
+    def invert(self, image_path=None, pil_image=None, prompt="", config: GenerationConfig=None, 
+               latent_storage=None, callback=None):
         pil_image = load_image(image_path, pil_image)
         x = self.encode_image(pil_image)
+        
         inp_inv = prepare(self.t5, self.clip, x, prompt=prompt)
-        timesteps = get_schedule(info['num_steps'], inp_inv["img"].shape[1], shift=True)
-        if offload:
-            self.offload()
-        z = denoise_fn(self.flow, **inp_inv, timesteps=timesteps, guidance=1, inverse=True, info=info, callback=callback)
-        if offload:
-            self.onload()
-        image_info = {
+        
+        timesteps = get_schedule(config.num_steps, inp_inv["img"].shape[1], shift=True)
+        
+        image_info = {}
+        z = denoise_fn(self.flow, **inp_inv, timesteps=timesteps, guidance=1, inverse=True, 
+                      config=config, latent_storage=image_info, callback=callback)
+            
+        image_info.update({
             'z': z.cpu(),
-            'x': x.cpu(),
+            'x': x.cpu(), 
             'image': torch.tensor(np.array(pil_image)),
             'txt': inp_inv['txt'].cpu(),
             'vec': inp_inv['vec'].cpu(),
-        }
-        for t_str in info['image_info']['latents']:
-            assert len(info['image_info']['latents'][t_str]['ref_imgs']) == 1
-            image_info[t_str] = info['image_info']['latents'][t_str]['ref_imgs'][-1]
-            info['image_info']['latents'][t_str]['ref_imgs'] = []
+        })
+
         return image_info
             
     @torch.inference_mode()
     def encode_image(self, image):
         image_array = np.array(image)
         image = torch.from_numpy(image_array).permute(2, 0, 1).float() / 127.5 - 1
-        image = image.unsqueeze(0) 
-        image = image.to(self.device)
-        image = self.ae.encode(image.to()).to(torch.bfloat16)
+        image = image.unsqueeze(0).to(self.device)
+        if self.requires_offload:
+            self.onload(['ae'])
+        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+            image = self.ae.encode(image).to(torch.bfloat16)
+        if self.requires_offload:
+            self.offload(['ae'])
         return image    
     
     @torch.inference_mode()
-    def invert_and_record(self, image_path=None, pil_image=None, info=None, offload=False, callback=None):
+    def invert_and_record(self, image_path=None, pil_image=None, config: GenerationConfig=None, callback=None):
         if image_path is None:
-            image_path = save_image(pil_image)
+            image_path = save_image(pil_image, self.image_cache_dir)
         image_info = load_image_info(image_path, self.image_info_cache_dir)
         if not (image_info and 'z' in image_info):
-            image_info = self.invert(image_path=image_path, prompt="", info=info, offload=offload, callback=callback)
+            image_info = self.invert(image_path=image_path, prompt="", config=config, callback=callback)
             save_image_info(image_info, image_path, self.image_info_cache_dir)
         return image_info
     
     @torch.inference_mode()
-    def final_generation(self, prompt, all_image_info, info, offload=False, callback=None):
-        for image_info in all_image_info:
-            for key, value in image_info.items():
-                if 't_' in key:
-                    t_str = key
-                    if not isinstance(info['image_info']['latents'][t_str]['ref_imgs'], list):
-                        info['image_info']['latents'][t_str]['ref_imgs'] = []
-                    info['image_info']['latents'][t_str]['ref_imgs'].append(value)
-        init_noise = image_info['z'].to(self.device)
-        x = torch.randn((1, 16, info['height'] // 8, info['width'] // 8)).to(self.device).to(torch.bfloat16)
-        inp_gen = prepare(self.t5, self.clip, x, prompt=prompt)
+    def final_generation(self, prompt, all_image_info, config: GenerationConfig, inp_gen=None, callback=None):
+        init_noise = all_image_info[0]['z'].to(self.device)
+        x = torch.randn((1, 16, config.height // 8, config.width // 8), 
+                       device=self.device, dtype=torch.bfloat16)
         
-        inp_gen['ref_vecs'] = [all_image_info[idx]['vec'].cuda() for idx in range(len(all_image_info))]
-        inp_gen['ref_txts'] = [all_image_info[idx]['txt'].cuda() for idx in range(len(all_image_info))]
-        inp_gen['img'] = init_noise.cuda()
-        inp_gen['ref_imgs'] = [all_image_info[idx]['z'].cuda() for idx in range(len(all_image_info))]
-        inp_gen['ref_masks'] = [all_image_info[idx]['mask'].cuda() for idx in range(len(all_image_info))]
+        if inp_gen is None:
+            inp_gen = prepare(self.t5, self.clip, x, prompt=prompt)
+        inp_gen['ref_vecs'] = [item['vec'].to(self.device) for item in all_image_info]
+        inp_gen['ref_txts'] = [item['txt'].to(self.device) for item in all_image_info]
+        inp_gen['img'] = init_noise
+        inp_gen['ref_imgs'] = [item['z'].to(self.device) for item in all_image_info]
+        inp_gen['ref_masks'] = [item['mask'].to(self.device) for item in all_image_info]
         
-        timesteps = get_schedule(info['num_steps'], inp_gen["img"].shape[1], shift=True)
-        if offload:
-            self.offload()
-        gen_x, ref_x_recons = denoise_fn(self.flow, **inp_gen, timesteps=timesteps, guidance=info['guidance'], inverse=False, info=info, callback=callback)
-        if offload:
-            self.onload()
-        gen_x = unpack(gen_x.float(), info['width'], info['height'])
+        timesteps = get_schedule(config.num_steps, inp_gen["img"].shape[1], shift=True)
+        
+        gen_x, ref_x_recons = denoise_fn(self.flow, **inp_gen, timesteps=timesteps, guidance=config.guidance, inverse=False, config=config, latent_storage=all_image_info[0], callback=callback)
+        
+        gen_x = unpack(gen_x.float(), config.width, config.height)
+        if self.requires_offload:
+            self.onload(['ae'])
         with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
             x = self.ae.decode(gen_x)
+        if self.requires_offload:
+            self.offload(['ae'])
         x = x.clamp(-1, 1).float()
         x = rearrange(x[0], "c h w -> h w c")
         gen_image = Image.fromarray((127.5 * (x + 1.0)).cpu().byte().numpy())
@@ -210,29 +244,46 @@ class FreeGraftorPipeline:
         output_dir: str = 'inference_results', 
         clear_image_cache: bool = False,
         clear_image_info_cache: bool = False,
-        offload: bool = False,
-        info = None,
+        config: GenerationConfig = None,
         callback=None
     ):
         Path(output_dir).mkdir(exist_ok=True, parents=True)
         
-        if not template_prompt:
-            template_prompt = prompt
+        if config is None:
+            config = GenerationConfig()
         
-        collage, collage_mask_tensor = self.create_collage(template_prompt, concept_configs, info, template_path, offload=offload, callback=callback)
-        collage_path = save_image(collage, self.image_cache_dir, "collage")
         
-        collage_info = self.invert_and_record(image_path=collage_path, info=info, offload=offload, callback=lambda x,y: callback(x+info['num_steps'], y) if callback else None)
-        collage_info['mask'] = collage_mask_tensor.cpu()
         
-        gen_image = self.final_generation(prompt, [collage_info], info, offload=offload, callback=lambda x,y: callback(x+info['num_steps']*2, y) if callback else None)
-        
-        seed = info['seed']
-        save_image(gen_image, output_dir, f"seed{seed}")
-        
-        if clear_image_cache:
-            shutil.rmtree(self.image_cache_dir)
-        if clear_image_info_cache:
-            shutil.rmtree(self.image_info_cache_dir)
+        try:
+            if not template_prompt:
+                template_prompt = prompt
             
+            collage, collage_mask_tensor, inp_gen = self.create_collage(template_prompt, concept_configs, config, template_path, callback=callback)
+            collage_path = save_image(collage, self.image_cache_dir, "collage")
+            
+            collage_info = self.invert_and_record(image_path=collage_path, config=config, callback=lambda x,y: callback(x+config.num_steps, y) if callback else None)
+            
+            collage_info['mask'] = collage_mask_tensor.cpu()
+            
+            if prompt != template_prompt:
+                inp_gen = None
+            gen_image = self.final_generation(prompt, [collage_info], config,  inp_gen=inp_gen, callback=lambda x,y: callback(x+config.num_steps*2, y) if callback else None)
+            
+            seed = config.seed
+            save_image(gen_image, output_dir, f"seed{seed}")
+            
+            del collage_info
+            
+        finally:
+            if clear_image_cache and os.path.exists(self.image_cache_dir):
+                shutil.rmtree(self.image_cache_dir, ignore_errors=True)
+            if clear_image_info_cache and os.path.exists(self.image_info_cache_dir):
+                shutil.rmtree(self.image_info_cache_dir, ignore_errors=True)
+            
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            
+        
+        
         return gen_image

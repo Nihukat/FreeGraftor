@@ -151,8 +151,8 @@ class DoubleStreamBlock(nn.Module):
         )
 
     def forward(self, img: Tensor, ref_imgs: List[Tensor], ref_masks: List[Tensor], txt: Tensor, ref_txts: List[Tensor], 
-                vec: Tensor, ref_vecs: List[Tensor], txt_pe: Tensor, img_pe: Tensor, info) -> tuple[Tensor, Tensor]:
-        requires_inject = info['inject'] and info['global_block_id'] in info['inject_block_ids'] and not info['inverse'] and ref_imgs is not None
+                vec: Tensor, ref_vecs: List[Tensor], txt_pe: Tensor, img_pe: Tensor, context) -> tuple[Tensor, Tensor]:
+        requires_inject = context['inject'] and context['global_block_id'] in context['inject_block_ids'] and not context['inverse'] and ref_imgs is not None
         ref_imgs_, ref_txts_ = None, None
         if ref_imgs is not None and ref_txts is not None and ref_vecs is not None:
             ref_img_ks, ref_img_vs = [], []
@@ -221,17 +221,19 @@ class DoubleStreamBlock(nn.Module):
         if requires_inject:
             for ref_id, ref_img_modulated in enumerate(ref_img_modulateds):
                 src2tar_2d_xy, src2tar_match_mask, src2tar_1d = get_match(ref_img_modulated, img_modulated, 
-                                                                          h_src=info['height'] // 16, w_src=info['width'] // 16,
-                                                                          h_tar=info['height'] // 16, w_tar=info['width'] // 16,
-                                                                          sim_threshold=info['sim_threshold'], cyc_threshold=info['cyc_threshold'])
-                img_ids = info['image_info']['img_ids'].to(img)
-                ref_img_ids = apply_match(src2tar_2d_xy, img_ids, h_tar=info['height'] // 16, w_tar=info['width'] // 16)
-                ref_img_pe = info['pe_embedder'](ref_img_ids)
+                                                                          h_src=context['height'] // 16, w_src=context['width'] // 16,
+                                                                          h_tar=context['height'] // 16, w_tar=context['width'] // 16,
+                                                                          sim_threshold=context['sim_threshold'], cyc_threshold=context['cyc_threshold'])
+                
+                img_ids = context['img_ids'].to(img)
+                    
+                ref_img_ids = apply_match(src2tar_2d_xy, img_ids, h_tar=context['height'] // 16, w_tar=context['width'] // 16)
+                ref_img_pe = context['pe_embedder'](ref_img_ids)
                 
                 ref_mask = ref_masks[ref_id].to(img)
                 ref_mask *= src2tar_match_mask.squeeze(dim=0)
                 
-                dropout_p = info['t'] * info['inject_match_dropout']
+                dropout_p = context['t'] * context['inject_match_dropout']
                 ref_mask = dropout_binary_mask(ref_mask, dropout_p)
                             
                 seg_img_k = ref_img_ks[ref_id][:,:,ref_mask>0]
@@ -291,8 +293,8 @@ class SingleStreamBlock(nn.Module):
         self.modulation = Modulation(hidden_size, double=False)
 
     def forward(self, img: Tensor, ref_imgs: List[Tensor], ref_masks: List[Tensor], txt: Tensor, ref_txts: List[Tensor], 
-                vec: Tensor, ref_vecs: List[Tensor], txt_pe: Tensor, img_pe: Tensor, info) -> Tensor:
-        requires_inject = info['inject'] and info['global_block_id'] in info['inject_block_ids'] and not info['inverse'] and ref_imgs is not None
+                vec: Tensor, ref_vecs: List[Tensor], txt_pe: Tensor, img_pe: Tensor, context) -> Tensor:
+        requires_inject = context['inject'] and context['global_block_id'] in context['inject_block_ids'] and not context['inverse'] and ref_imgs is not None
         
         l1 = txt.shape[1]
         l2 = img.shape[1]
@@ -350,17 +352,19 @@ class SingleStreamBlock(nn.Module):
             for ref_id, ref_img in enumerate(ref_imgs):
                 ref_img_mod = ref_img_mods[ref_id]
                 src2tar_2d_xy, src2tar_match_mask, src2tar_1d = get_match(ref_img_mod, img_mod, 
-                                                                          h_src=info['height'] // 16, w_src=info['width'] // 16,
-                                                                          h_tar=info['height'] // 16, w_tar=info['width'] // 16,
-                                                                          sim_threshold=info['sim_threshold'], cyc_threshold=info['cyc_threshold'])
-                img_ids = info['image_info']['img_ids'].to(img)
-                ref_img_ids = apply_match(src2tar_2d_xy, img_ids, h_tar=info['height'] // 16, w_tar=info['width'] // 16)
-                ref_img_pe = info['pe_embedder'](ref_img_ids)            
+                                                                          h_src=context['height'] // 16, w_src=context['width'] // 16,
+                                                                          h_tar=context['height'] // 16, w_tar=context['width'] // 16,
+                                                                          sim_threshold=context['sim_threshold'], cyc_threshold=context['cyc_threshold'])
+                
+                img_ids = context['img_ids'].to(img)
+                    
+                ref_img_ids = apply_match(src2tar_2d_xy, img_ids, h_tar=context['height'] // 16, w_tar=context['width'] // 16)
+                ref_img_pe = context['pe_embedder'](ref_img_ids)            
                 
                 ref_mask = ref_masks[ref_id].to(img)
                 ref_mask *= src2tar_match_mask.squeeze(dim=0)
                 
-                dropout_p = info['t'] * info['inject_match_dropout']
+                dropout_p = context['t'] * context['inject_match_dropout']
                 
                 ref_mask = dropout_binary_mask(ref_mask, dropout_p)
                 
