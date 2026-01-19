@@ -9,6 +9,8 @@ Zebin Yao, &nbsp; Lei Ren, &nbsp; Huixing Jiang, &nbsp; Wei Chen, &nbsp; Xiaojie
 
 </div>
 
+<img src="assets/teaser.png" width=100%>
+
 ## 🛠️ Installation
 
 ```bash
