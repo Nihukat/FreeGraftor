@@ -120,7 +120,7 @@ python src/app.py
 ## ✅ To-Do List
 
 - [ ] More Usage and Applications
-- [ ] Support for Stable Diffusion 3
+- [ ] Support for More Models
 - [ ] Visualization Results
 - [x] Gradio Demo
 - [x] Source Code
